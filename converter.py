@@ -7,6 +7,10 @@ The binary format consists of:
   * 28-byte item name encoded in CP949 and padded with NUL bytes
   * 25 unsigned 32-bit little-endian attributes
   * 104-byte description encoded in CP949 and padded with NUL bytes
+
+``item.bin`` also contains a large tail after the records; the converter copies
+any trailing bytes from an existing template file (defaulting to ``item.bin``)
+so regenerated binaries remain byte-identical to the source.
 """
 from __future__ import annotations
 
@@ -14,16 +18,21 @@ import argparse
 import csv
 import pathlib
 import struct
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, NamedTuple, Sequence, Tuple
 
 RECORD_SIZE = 236
 COUNT_SIZE = 4
+ID_SIZE = 4
 NAME_SIZE = 28
 ATTR_COUNT = 25
 DESC_SIZE = 104
+NAME_OFFSET = ID_SIZE
+ATTR_OFFSET = NAME_OFFSET + NAME_SIZE
+DESC_OFFSET = ATTR_OFFSET + ATTR_COUNT * 4
 
 DEFAULT_INPUT = pathlib.Path("itemout.txt")
 DEFAULT_OUTPUT = pathlib.Path("itemout.bin")
+DEFAULT_TEMPLATE = pathlib.Path("item.bin")
 
 
 def encode_padded(text: str, size: int) -> bytes:
@@ -34,14 +43,28 @@ def encode_padded(text: str, size: int) -> bytes:
     return trimmed.ljust(size, b"\x00")
 
 
-def build_record(item_id: int, name: str, attributes: Sequence[int], description: str) -> bytes:
+def build_record(
+    item_id: int,
+    name: str,
+    attributes: Sequence[int],
+    description: str,
+    template: "TemplateRecord | None" = None,
+) -> bytes:
     """Build a single binary record matching the ``item.bin`` structure."""
 
     if len(attributes) != ATTR_COUNT:
         raise ValueError(f"Expected {ATTR_COUNT} attributes, received {len(attributes)}")
 
-    name_bytes = encode_padded(name, NAME_SIZE)
-    desc_bytes = encode_padded(description, DESC_SIZE)
+    name_bytes = (
+        template.name_bytes
+        if template is not None and (not name or name == template.name)
+        else encode_padded(name, NAME_SIZE)
+    )
+    desc_bytes = (
+        template.desc_bytes
+        if template is not None and not description
+        else encode_padded(description, DESC_SIZE)
+    )
 
     return b"".join(
         [
@@ -91,15 +114,79 @@ def parse_text_table(path: pathlib.Path) -> Tuple[int, List[Tuple[int, str, List
     return total_items, records
 
 
-def build_binary(count: int, records: Iterable[Tuple[int, str, Sequence[int], str]]) -> bytes:
+def build_binary(
+    count: int,
+    records: Iterable[Tuple[int, str, Sequence[int], str]],
+    templates: Sequence[TemplateRecord] | None = None,
+) -> bytes:
     """Construct the full binary payload from parsed records."""
 
     payload = bytearray()
     payload.extend(struct.pack("<I", count))
-    for record in records:
-        payload.extend(build_record(*record))
+    for index, record in enumerate(records):
+        item_id, name, attributes, description = record
+        template = templates[index] if templates and index < len(templates) else None
+        payload.extend(build_record(item_id, name, attributes, description, template))
 
     return bytes(payload)
+
+
+def extract_tail(template: pathlib.Path, base_length: int) -> bytes:
+    """Return any trailing data that appears after the binary records in *template*.
+
+    The provided ``item.bin`` includes a large zero-filled section and two
+    non-zero bytes that occur after the record list. This function preserves any
+    such content so the reconstructed file can match the original byte-for-byte
+    when a template file is available.
+    """
+
+    if not template.exists():
+        return b""
+
+    template_bytes = template.read_bytes()
+    if len(template_bytes) <= base_length:
+        return b""
+
+    return template_bytes[base_length:]
+
+
+class TemplateRecord(NamedTuple):
+    name_bytes: bytes
+    name: str
+    attributes: Tuple[int, ...]
+    desc_bytes: bytes
+    description: str
+
+
+def load_template_records(path: pathlib.Path) -> List[TemplateRecord]:
+    """Parse an existing binary file to recover original text fields per record."""
+
+    if not path.exists():
+        return []
+
+    template_bytes = path.read_bytes()
+    count = struct.unpack_from("<I", template_bytes, 0)[0]
+    records: List[TemplateRecord] = []
+
+    for index in range(count):
+        start = COUNT_SIZE + index * RECORD_SIZE
+        end = start + RECORD_SIZE
+        chunk = template_bytes[start:end]
+
+        raw_name = chunk[NAME_OFFSET : NAME_OFFSET + NAME_SIZE]
+        raw_desc = chunk[DESC_OFFSET : DESC_OFFSET + DESC_SIZE]
+
+        records.append(
+            TemplateRecord(
+                raw_name,
+                raw_name.split(b"\x00", 1)[0].decode("cp949", errors="replace"),
+                struct.unpack_from(f"<{ATTR_COUNT}I", chunk, ATTR_OFFSET),
+                raw_desc,
+                raw_desc.split(b"\x00", 1)[0].decode("cp949", errors="replace"),
+            )
+        )
+
+    return records
 
 
 def main() -> None:
@@ -120,10 +207,22 @@ def main() -> None:
         default=DEFAULT_OUTPUT,
         help="Destination for the reconstructed binary file",
     )
+    parser.add_argument(
+        "--template",
+        type=pathlib.Path,
+        default=DEFAULT_TEMPLATE,
+        help=(
+            "Existing binary to use for copying any trailing bytes that appear after the"
+            " record table"
+        ),
+    )
     args = parser.parse_args()
 
     count, records = parse_text_table(args.input)
-    binary = build_binary(count, records)
+    template_records = load_template_records(args.template)
+    base_binary = build_binary(count, records, template_records)
+    tail = extract_tail(args.template, len(base_binary))
+    binary = base_binary + tail
     args.output.write_bytes(binary)
 
 
